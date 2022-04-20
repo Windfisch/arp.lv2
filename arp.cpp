@@ -7,6 +7,9 @@
 
 #include <sndfile.h>
 
+#include <array>
+#include <concepts>
+
 #include "lv2/lv2plug.in/ns/ext/atom/util.h"
 #include "lv2/lv2plug.in/ns/ext/midi/midi.h"
 #include "lv2/lv2plug.in/ns/ext/patch/patch.h"
@@ -27,6 +30,25 @@ enum {
 	MIDI_OUT = 1
 };
 
+template<size_t N> struct Arpeggio {
+	uint64_t start_time;
+	uint64_t duration;
+	std::array<int, N> notes;
+
+	template<typename Func> requires std::invocable<Func&, uint64_t, int>
+	void process(uint64_t from, uint64_t until, Func callback) {
+		for (size_t i=0; i<N; i++) {
+			auto valid_from = start_time + i * duration / N;
+			auto valid_until = start_time + (i+1) * duration / N;
+
+			if (from <= valid_from && valid_from < until) {
+				callback(valid_from, notes[i]);
+			}
+		}
+	}
+};
+
+
 struct Arp {
 	LV2_URID_Map* map;
 
@@ -34,6 +56,10 @@ struct Arp {
 	LV2_Atom_Sequence* out_port;
 
 	ArpURIs uris;
+
+	uint64_t time = 0;
+
+	Arpeggio<4> current_arpeggio;
 
 	void connect_port(uint32_t port, void* data)
 	{
@@ -58,61 +84,68 @@ struct Arp {
 	}
 
 	void run(uint32_t sample_count) {
-		// Struct for a 3 byte MIDI event, used for writing notes
 		struct MIDINoteEvent {
 			LV2_Atom_Event event;
-			uint8_t        msg[3];
+			std::array<uint8_t, 3> msg;
 		};
 
-		// Initially self->out_port contains a Chunk with size set to capacity
 
-		// Get the capacity
 		const uint32_t out_capacity = out_port->atom.size;
-
-		// Write an empty Sequence header to the output
 		lv2_atom_sequence_clear(out_port);
 		out_port->atom.type = in_port->atom.type;
 
-		// Read incoming events
+		uint64_t offset = 0;
+
+		auto blah = [this, &out_capacity](uint64_t time, int transpose) {
+			auto pitchbend = 0x2000 + transpose * 0x1FFF / 12;
+			uint8_t msb = (pitchbend >> 7) & 0x7F;
+			uint8_t lsb = pitchbend & 0x7F;
+
+			MIDINoteEvent event;
+			event.event.body.type = this->uris.midi_Event;
+			event.event.body.size = 3;
+			event.event.time.frames = time - this->time;
+			event.msg = { 0xE0, lsb, msb };
+
+			lv2_atom_sequence_append_event(this->out_port, out_capacity, &event.event);
+		};
+		
 		LV2_ATOM_SEQUENCE_FOREACH(in_port, ev) {
 			if (ev->body.type == uris.midi_Event) {
+				current_arpeggio.process(time + offset, time + ev->time.frames, blah);
+				offset = ev->time.frames;
+
 				const uint8_t* const msg = (const uint8_t*)(ev + 1);
+
 				switch (lv2_midi_message_type(msg)) {
-				case LV2_MIDI_MSG_NOTE_ON:
-				case LV2_MIDI_MSG_NOTE_OFF:
-				{
-					// Forward note to output
-					lv2_atom_sequence_append_event(
-						out_port, out_capacity, ev);
+					case LV2_MIDI_MSG_NOTE_ON:
+					case LV2_MIDI_MSG_NOTE_OFF:
+					{
+						lv2_atom_sequence_append_event(out_port, out_capacity, ev);
 
-					const uint8_t note = msg[1];
-					if (note <= 127 - 7) {
-						// Make a note one 5th (7 semitones) higher than input
-						MIDINoteEvent fifth;
-						
-						// Could simply do fifth.event = *ev here instead...
-						fifth.event.time.frames = ev->time.frames;  // Same time
-						fifth.event.body.type   = ev->body.type;    // Same type
-						fifth.event.body.size   = ev->body.size;    // Same size
-						
-						fifth.msg[0] = msg[0];      // Same status
-						fifth.msg[1] = msg[1] + 7;  // Pitch up 7 semitones
-						fifth.msg[2] = msg[2];      // Same velocity
+						set_arpeggio(0x37, time + ev->time.frames);
 
-						// Write 5th event
-						lv2_atom_sequence_append_event(
-							out_port, out_capacity, &fifth.event);
+						break;
 					}
-					break;
-				}
-				default:
-					// Forward all other MIDI events directly
-					lv2_atom_sequence_append_event(
-						out_port, out_capacity, ev);
-					break;
+					default:
+						// Forward all other MIDI events directly
+						lv2_atom_sequence_append_event(out_port, out_capacity, ev);
+						break;
 				}
 			}
 		}
+		
+		current_arpeggio.process(time + offset, time + sample_count, blah);
+
+		time += sample_count;
+	}
+
+	void set_arpeggio(uint8_t arpeggio, uint64_t timestamp) {
+		current_arpeggio = Arpeggio<4> {
+			timestamp,
+			12000,
+			{ 0, (arpeggio & 0xF0) >> 4, arpeggio & 0x0F, 0 }
+		};
 	}
 };
 
