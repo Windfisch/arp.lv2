@@ -21,6 +21,8 @@
 #include "lv2/lv2plug.in/ns/ext/midi/midi.h"
 #include "lv2/lv2plug.in/ns/ext/state/state.h"
 
+#define MIDI_ARP_CC 0x70
+
 typedef struct {
 	LV2_URID midi_Event;
 } ArpURIs;
@@ -32,14 +34,14 @@ enum {
 
 template<size_t N> struct Arpeggio {
 	uint64_t start_time;
-	uint64_t duration;
+	uint64_t time_per_step;
 	std::array<int, N> notes;
 
 	template<typename Func> requires std::invocable<Func&, uint64_t, int>
 	void process(uint64_t from, uint64_t until, Func callback) {
 		for (size_t i=0; i<N; i++) {
-			auto valid_from = start_time + i * duration / N;
-			auto valid_until = start_time + (i+1) * duration / N;
+			auto valid_from = start_time + i * time_per_step;
+			auto valid_until = start_time + (i+1) * time_per_step;
 
 			if (from <= valid_from && valid_from < until) {
 				callback(valid_from, notes[i]);
@@ -48,6 +50,20 @@ template<size_t N> struct Arpeggio {
 	}
 };
 
+class ClockTracker {
+	public:
+		explicit ClockTracker(uint64_t initial_time_per_clock) : time_per_clock_(initial_time_per_clock) {}
+		void clock(uint64_t time_now) {
+			if (last_time > 0) {
+				time_per_clock_ = time_now - last_time;
+			}
+			last_time = time_now;
+		}
+		uint64_t time_per_clock() { return time_per_clock_; }
+	private:
+		uint64_t time_per_clock_;
+		uint64_t last_time = 0;
+};
 
 struct Arp {
 	LV2_URID_Map* map;
@@ -60,6 +76,10 @@ struct Arp {
 	uint64_t time = 0;
 
 	Arpeggio<4> current_arpeggio;
+
+	ClockTracker tempo_tracker;
+	ClockTracker arp_speed_tracker;
+	uint64_t arp_speed_time_per_midiclock;
 
 	void connect_port(uint32_t port, void* data)
 	{
@@ -79,8 +99,11 @@ struct Arp {
 		: map(map)
 		, in_port(nullptr)
 		, out_port(nullptr)
+		, tempo_tracker(48000 / (120*24/60)) // assume 120bpm clock at 24 clocks per quarter note for 48kHz sampling rate
+		, arp_speed_tracker(48000 / (120*24/60))
 	{
 		uris.midi_Event = map->map(map->handle, LV2_MIDI__MidiEvent);
+		arp_speed_time_per_midiclock = tempo_tracker.time_per_clock();
 	}
 
 	void run(uint32_t sample_count) {
@@ -96,8 +119,8 @@ struct Arp {
 
 		uint64_t offset = 0;
 
-		auto blah = [this, &out_capacity](uint64_t time, int transpose) {
-			auto pitchbend = 0x2000 + transpose * 0x1FFF / 12;
+		auto arpeggio_pitchbend = [this, &out_capacity](uint64_t time, int transpose) {
+			uint32_t pitchbend = 0x2000 + transpose * 0x1FFF / 12;
 			uint8_t msb = (pitchbend >> 7) & 0x7F;
 			uint8_t lsb = pitchbend & 0x7F;
 
@@ -112,19 +135,39 @@ struct Arp {
 		
 		LV2_ATOM_SEQUENCE_FOREACH(in_port, ev) {
 			if (ev->body.type == uris.midi_Event) {
-				current_arpeggio.process(time + offset, time + ev->time.frames, blah);
+				current_arpeggio.process(time + offset, time + ev->time.frames, arpeggio_pitchbend);
 				offset = ev->time.frames;
 
 				const uint8_t* const msg = (const uint8_t*)(ev + 1);
 
 				switch (lv2_midi_message_type(msg)) {
-					case LV2_MIDI_MSG_NOTE_ON:
-					case LV2_MIDI_MSG_NOTE_OFF:
+					case LV2_MIDI_MSG_CLOCK:
 					{
+						tempo_tracker.clock(time + ev->time.frames);
 						lv2_atom_sequence_append_event(out_port, out_capacity, ev);
-
-						set_arpeggio(0x37, time + ev->time.frames);
-
+						break;
+					}
+					case LV2_MIDI_MSG_CONTROLLER:
+					{
+						if (msg[1] == MIDI_ARP_CC) {
+							if (msg[2] == 0x00) { // calibrate
+								arp_speed_tracker.clock(time + ev->time.frames);
+								arp_speed_time_per_midiclock = tempo_tracker.time_per_clock();
+							}
+							else {
+								// midiclocks per arp time unit = arp_speed_tracker.time_per_clock() / arp_speed_time_per_midiclock
+								// time per arp time unit = midiclocks per arp time unit * time per midiclock
+								// time per arp step = time per arp time unit / 3;
+								set_arpeggio(
+									msg[2],
+									time + ev->time.frames,
+									arp_speed_tracker.time_per_clock() * tempo_tracker.time_per_clock() / arp_speed_time_per_midiclock / 3
+								);
+							}
+						}
+						else {
+							lv2_atom_sequence_append_event(out_port, out_capacity, ev);
+						}
 						break;
 					}
 					default:
@@ -135,15 +178,15 @@ struct Arp {
 			}
 		}
 		
-		current_arpeggio.process(time + offset, time + sample_count, blah);
+		current_arpeggio.process(time + offset, time + sample_count, arpeggio_pitchbend);
 
 		time += sample_count;
 	}
 
-	void set_arpeggio(uint8_t arpeggio, uint64_t timestamp) {
+	void set_arpeggio(uint8_t arpeggio, uint64_t timestamp, uint64_t time_per_step) {
 		current_arpeggio = Arpeggio<4> {
 			timestamp,
-			12000,
+			time_per_step,
 			{ 0, (arpeggio & 0xF0) >> 4, arpeggio & 0x0F, 0 }
 		};
 	}
