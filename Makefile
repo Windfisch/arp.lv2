@@ -1,4 +1,7 @@
-all: arp.so
+all: arp.so plugin
+plugin:
+	mkdir -p arp.lv2
+	cp arp.so arp.ttl manifest.ttl arp.lv2/
 
 arp.so: arp.cpp
 	g++ -std=c++20 -fPIC -shared arp.cpp -o arp.so
